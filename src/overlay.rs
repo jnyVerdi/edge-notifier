@@ -4,16 +4,17 @@ use std::time::Instant;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS,
     HBITMAP, HDC, HGDIOBJ,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetSystemMetrics, KillTimer, RegisterClassW, SetTimer,
-    ShowWindow, UpdateLayeredWindow, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW,
-    ULW_ALPHA, WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetSystemMetrics, KillTimer, RegisterClassW,
+    SetProcessDPIAware, SetTimer, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA,
+    WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 pub const WM_TRIGGER_GLOW: u32 = WM_USER + 101;
@@ -49,6 +50,7 @@ impl Overlay {
         let class_name = w!("ScreenGlowOverlayClass");
 
         unsafe {
+            let _ = SetProcessDPIAware();
             let hinstance = GetModuleHandleW(None)?;
 
             let wc = WNDCLASSW {
@@ -225,6 +227,7 @@ impl Overlay {
 
     pub fn commit_alpha(&self, alpha: u8) {
         unsafe {
+            let screen_dc = GetDC(None);
             let pt_dst = POINT { x: 0, y: 0 };
             let sz_dst = SIZE {
                 cx: self.width,
@@ -240,7 +243,7 @@ impl Overlay {
 
             let _ = UpdateLayeredWindow(
                 self.hwnd,
-                HDC::default(),
+                screen_dc,
                 Some(&pt_dst),
                 Some(&sz_dst),
                 self.mem_dc,
@@ -249,6 +252,7 @@ impl Overlay {
                 Some(&blend),
                 ULW_ALPHA,
             );
+            let _ = ReleaseDC(None, screen_dc);
         }
     }
 
@@ -276,11 +280,19 @@ impl Overlay {
         self.is_pulsing = true;
 
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                self.width,
+                self.height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
             let _ = SetTimer(self.hwnd, TIMER_ID_PULSE, 16, None);
         }
 
-        let initial_alpha = (config.glow.min_opacity * 255.0) as u8;
+        let initial_alpha = (config.glow.max_opacity * 255.0) as u8;
         self.commit_alpha(initial_alpha);
     }
 
@@ -317,6 +329,7 @@ impl Overlay {
             let _ = KillTimer(self.hwnd, TIMER_ID_PULSE);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+        self.commit_alpha(0);
     }
 }
 
