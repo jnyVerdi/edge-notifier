@@ -1,5 +1,3 @@
-#![windows_subsystem = "windows"]
-
 mod config;
 mod overlay;
 mod server;
@@ -12,6 +10,7 @@ use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Duration;
 use tray::{TrayIcon, WM_TRAYICON};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
@@ -22,8 +21,8 @@ pub const WM_SERVER_NOTIFY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_US
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    println!("[Main] Starting with args: {:?}", args);
 
-    // Check if invoked as a CLI client to trigger notification
     if args.len() > 1 && (args[1] == "notify" || args[1] == "--trigger" || args[1] == "-t") {
         let config = Config::load_or_create("config.toml");
         trigger_via_cli(&args[2..], config.server.port);
@@ -77,6 +76,15 @@ fn trigger_via_cli(args: &[String], port: u16) {
     };
 
     let addr = format!("127.0.0.1:{}", port);
+
+    if TcpStream::connect(&addr).is_err() {
+        println!("[CLI] Daemon not found, starting...");
+        if let Ok(exe_path) = env::current_exe() {
+            let _ = std::process::Command::new(exe_path).spawn();
+            std::thread::sleep(Duration::from_millis(600));
+        }
+    }
+
     if let Ok(mut stream) = TcpStream::connect(&addr) {
         let req = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -85,14 +93,29 @@ fn trigger_via_cli(args: &[String], port: u16) {
         let _ = stream.write_all(req.as_bytes());
         let mut resp = String::new();
         let _ = stream.read_to_string(&mut resp);
+        println!("✨ Edge glow notification triggered successfully!");
+    } else {
+        eprintln!("❌ Failed to connect to notifier on {}", addr);
     }
 }
 
 fn run_daemon() {
-    let mut config = Config::load_or_create("config.toml");
+    println!("[Daemon] Initializing...");
+    let config = Config::load_or_create("config.toml");
+    let addr = format!("127.0.0.1:{}", config.server.port);
 
+    if config.server.enabled && TcpStream::connect(&addr).is_ok() {
+        println!("[Daemon] Another instance is already listening on {}. Triggering it...", addr);
+        trigger_via_cli(&[], config.server.port);
+        return;
+    }
+
+    let mut config = config;
     let mut overlay = match Overlay::new(&config) {
-        Ok(o) => o,
+        Ok(o) => {
+            println!("[Daemon] Overlay created successfully (hwnd: {:?})", o.hwnd);
+            o
+        }
         Err(e) => {
             eprintln!("[Error] Failed to initialize overlay: {:?}", e);
             return;
@@ -100,16 +123,28 @@ fn run_daemon() {
     };
 
     let _tray = TrayIcon::new(overlay.hwnd);
+    println!("[Daemon] Tray icon created.");
+
     let (tx, rx): (Sender<NotifyRequest>, Receiver<NotifyRequest>) = channel();
 
     if config.server.enabled {
         start_server(config.server.port, tx, overlay.hwnd.0 as usize);
+        println!("[Daemon] Server started on port {}", config.server.port);
     }
 
-    // Windows Message Loop
+    println!("[Daemon] Triggering welcome glow...");
+    overlay.trigger_glow(&config, None, Some(1.5), None);
+
+    println!("[Daemon] Entering message loop...");
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        loop {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            if ret.0 == 0 || ret.0 == -1 {
+                println!("[Daemon] GetMessageW returned {}, exiting loop", ret.0);
+                break;
+            }
+
             match msg.message {
                 WM_TIMER => {
                     if msg.wParam.0 == TIMER_ID_PULSE {
@@ -117,9 +152,11 @@ fn run_daemon() {
                     }
                 }
                 WM_TRIGGER_GLOW => {
+                    println!("[Daemon] WM_TRIGGER_GLOW received");
                     overlay.trigger_glow(&config, None, None, None);
                 }
                 WM_SERVER_NOTIFY => {
+                    println!("[Daemon] WM_SERVER_NOTIFY received");
                     while let Ok(req) = rx.try_recv() {
                         overlay.trigger_glow(
                             &config,
@@ -130,6 +167,7 @@ fn run_daemon() {
                     }
                 }
                 WM_RELOAD_CONFIG => {
+                    println!("[Daemon] Reloading config");
                     config = Config::load_or_create("config.toml");
                     let rgb = config.rgb();
                     overlay.render_gradient(rgb, config.glow.border_width);
@@ -141,9 +179,11 @@ fn run_daemon() {
                     }
                 }
                 WM_CLOSE | WM_DESTROY => {
+                    println!("[Daemon] WM_CLOSE/DESTROY received");
                     PostQuitMessage(0);
                 }
                 WM_QUIT => {
+                    println!("[Daemon] WM_QUIT received");
                     break;
                 }
                 _ => {
@@ -153,4 +193,5 @@ fn run_daemon() {
             }
         }
     }
+    println!("[Daemon] Exited.");
 }
