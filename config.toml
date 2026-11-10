@@ -1,0 +1,13 @@
+# Screen Glow Notifier Configuration
+
+[glow]
+color = "#FF2222"         # Hex color (e.g. #FF2222, #00E5FF, #76FF03, #FFD600)
+border_width = 45         # Thickness of gradient in pixels
+pulse_speed = 1.8         # Pulsation speed (Hz / cycles per second)
+duration_secs = 5.0       # Auto-dismiss timeout in seconds (0 = stay on until dismissed)
+max_opacity = 0.85        # Peak opacity during pulse (0.1 - 1.0)
+min_opacity = 0.15        # Minimum opacity during pulse (0.0 - 0.5)
+
+[server]
+enabled = true
+port = 4545               # Local trigger port (http://127.0.0.1:4545/notify)
