@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 use std::thread;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
 #[derive(Debug, Clone)]
 pub struct NotifyRequest {
@@ -12,16 +12,7 @@ pub struct NotifyRequest {
     pub border_width: Option<u32>,
 }
 
-pub fn start_server(port: u16, tx: Sender<NotifyRequest>, hwnd_val: usize) {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[Server] Failed to bind to {}: {}", addr, e);
-            return;
-        }
-    };
-
+pub fn start_server(listener: TcpListener, tx: Sender<NotifyRequest>, hwnd_val: usize) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             if let Ok(stream) = stream {
@@ -58,6 +49,21 @@ fn handle_connection(mut stream: TcpStream, tx: Sender<NotifyRequest>, hwnd_val:
             body
         );
         let _ = stream.write_all(response.as_bytes());
+        return;
+    }
+
+    if target.starts_with("/quit") {
+        let body = r#"{"status":"quitting"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        unsafe {
+            let hwnd = HWND(hwnd_val as *mut std::ffi::c_void);
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
         return;
     }
 

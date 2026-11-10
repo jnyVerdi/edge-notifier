@@ -12,9 +12,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetSystemMetrics, KillTimer, RegisterClassW,
     SetProcessDPIAware, SetTimer, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST,
-    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA,
     WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 pub const WM_TRIGGER_GLOW: u32 = WM_USER + 101;
@@ -62,7 +62,10 @@ impl Overlay {
             let _ = RegisterClassW(&wc);
 
             let width = GetSystemMetrics(SM_CXSCREEN);
-            let height = GetSystemMetrics(SM_CYSCREEN);
+            // Subtract 1px from height so Windows 10/11 DWM never classifies this
+            // WS_POPUP window as an exclusive fullscreen game window (which suppresses
+            // WS_EX_LAYERED alpha compositing over the desktop).
+            let height = (GetSystemMetrics(SM_CYSCREEN) - 1).max(1);
 
             let hwnd = CreateWindowExW(
                 WS_EX_LAYERED
@@ -72,7 +75,7 @@ impl Overlay {
                     | WS_EX_NOACTIVATE,
                 class_name,
                 w!("ScreenGlowOverlay"),
-                WS_POPUP,
+                WS_POPUP | WS_VISIBLE,
                 0,
                 0,
                 width,
@@ -83,25 +86,27 @@ impl Overlay {
                 None,
             )?;
 
-            let mem_dc = CreateCompatibleDC(None);
+            let screen_dc = GetDC(None);
+            let mem_dc = CreateCompatibleDC(screen_dc);
 
             let mut bmi = BITMAPINFO::default();
             bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
             bmi.bmiHeader.biWidth = width;
-            bmi.bmiHeader.biHeight = -height; // Top-down
+            bmi.bmiHeader.biHeight = -height; // Top-down DIB
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB.0;
 
             let mut ppv_bits: *mut c_void = std::ptr::null_mut();
             let bitmap = CreateDIBSection(
-                mem_dc,
+                screen_dc,
                 &bmi,
                 DIB_RGB_COLORS,
                 &mut ppv_bits,
                 None,
                 0,
             )?;
+            let _ = ReleaseDC(None, screen_dc);
 
             let old_bmp = SelectObject(mem_dc, bitmap);
             let pixel_ptr = ppv_bits as *mut u8;
@@ -129,6 +134,17 @@ impl Overlay {
         }
     }
 
+    #[inline]
+    fn compute_edge_alpha(dist: i32, bw_f: f32) -> u32 {
+        if dist <= 4 {
+            255
+        } else {
+            let t = (1.0 - ((dist - 4) as f32 / (bw_f - 4.0).max(1.0))).clamp(0.0, 1.0);
+            let glow = t.powf(1.35);
+            (255.0 * glow).clamp(0.0, 255.0) as u32
+        }
+    }
+
     pub fn render_gradient(&mut self, (r, g, b): (u8, u8, u8), border_width: u32) {
         if self.pixel_ptr.is_null() || border_width == 0 {
             return;
@@ -153,9 +169,7 @@ impl Overlay {
                 if dist_y >= bw {
                     // Left border (0..bw)
                     for x in 0..bw {
-                        let t = 1.0 - (x as f32 / bw_f);
-                        let smooth = t * t * (3.0 - 2.0 * t);
-                        let a = (255.0 * smooth).clamp(0.0, 255.0) as u32;
+                        let a = Self::compute_edge_alpha(x, bw_f);
 
                         let pr = ((r as u32 * a) / 255) as u8;
                         let pg = ((g as u32 * a) / 255) as u8;
@@ -178,9 +192,7 @@ impl Overlay {
                     // Right border (w - bw .. w)
                     for x in (w - bw)..w {
                         let dist_x = w - 1 - x;
-                        let t = 1.0 - (dist_x as f32 / bw_f);
-                        let smooth = t * t * (3.0 - 2.0 * t);
-                        let a = (255.0 * smooth).clamp(0.0, 255.0) as u32;
+                        let a = Self::compute_edge_alpha(dist_x, bw_f);
 
                         let pr = ((r as u32 * a) / 255) as u8;
                         let pg = ((g as u32 * a) / 255) as u8;
@@ -199,9 +211,7 @@ impl Overlay {
                         let dist = dist_x.min(dist_y);
 
                         if dist < bw {
-                            let t = 1.0 - (dist as f32 / bw_f);
-                            let smooth = t * t * (3.0 - 2.0 * t);
-                            let a = (255.0 * smooth).clamp(0.0, 255.0) as u32;
+                            let a = Self::compute_edge_alpha(dist, bw_f);
 
                             let pr = ((r as u32 * a) / 255) as u8;
                             let pg = ((g as u32 * a) / 255) as u8;
@@ -241,7 +251,7 @@ impl Overlay {
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
 
-            let _ = UpdateLayeredWindow(
+            if let Err(e) = UpdateLayeredWindow(
                 self.hwnd,
                 screen_dc,
                 Some(&pt_dst),
@@ -251,7 +261,9 @@ impl Overlay {
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
+            ) {
+                eprintln!("[Overlay] UpdateLayeredWindow error: {:?}", e);
+            }
             let _ = ReleaseDC(None, screen_dc);
         }
     }
@@ -280,6 +292,7 @@ impl Overlay {
         self.is_pulsing = true;
 
         unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
@@ -292,7 +305,7 @@ impl Overlay {
             let _ = SetTimer(self.hwnd, TIMER_ID_PULSE, 16, None);
         }
 
-        let initial_alpha = (config.glow.max_opacity * 255.0) as u8;
+        let initial_alpha = (config.glow.max_opacity * 255.0).clamp(0.0, 255.0) as u8;
         self.commit_alpha(initial_alpha);
     }
 
@@ -311,7 +324,8 @@ impl Overlay {
 
             let speed = config.glow.pulse_speed;
             let t = elapsed * speed * std::f32::consts::TAU;
-            let factor = 0.5 * (1.0 + (t - std::f32::consts::FRAC_PI_2).sin());
+            // Use cos(t) so that at t = 0.0, factor starts at 1.0 (max_opacity)
+            let factor = 0.5 * (1.0 + t.cos());
 
             let min_a = config.glow.min_opacity;
             let max_a = config.glow.max_opacity;
@@ -327,7 +341,6 @@ impl Overlay {
         self.pulse_start = None;
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_ID_PULSE);
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.commit_alpha(0);
     }

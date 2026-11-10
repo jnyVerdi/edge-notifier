@@ -8,7 +8,7 @@ use overlay::{Overlay, TIMER_ID_PULSE, WM_RELOAD_CONFIG, WM_TRIGGER_GLOW};
 use server::{start_server, NotifyRequest};
 use std::env;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 use tray::{TrayIcon, WM_TRAYICON};
@@ -21,7 +21,6 @@ pub const WM_SERVER_NOTIFY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_US
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    println!("[Main] Starting with args: {:?}", args);
 
     if args.len() > 1 && (args[1] == "notify" || args[1] == "--trigger" || args[1] == "-t") {
         let config = Config::load_or_create("config.toml");
@@ -30,6 +29,11 @@ fn main() {
     }
 
     run_daemon();
+}
+
+fn connect_fast(port: u16) -> std::io::Result<TcpStream> {
+    let sock_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+    TcpStream::connect_timeout(&sock_addr, Duration::from_millis(100))
 }
 
 fn trigger_via_cli(args: &[String], port: u16) {
@@ -77,15 +81,23 @@ fn trigger_via_cli(args: &[String], port: u16) {
 
     let addr = format!("127.0.0.1:{}", port);
 
-    if TcpStream::connect(&addr).is_err() {
-        println!("[CLI] Daemon not found, starting...");
+    let mut stream_opt = connect_fast(port).ok();
+
+    if stream_opt.is_none() {
+        println!("[CLI] Daemon not running yet, starting background daemon...");
         if let Ok(exe_path) = env::current_exe() {
             let _ = std::process::Command::new(exe_path).spawn();
-            std::thread::sleep(Duration::from_millis(600));
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(50));
+                if let Ok(s) = connect_fast(port) {
+                    stream_opt = Some(s);
+                    break;
+                }
+            }
         }
     }
 
-    if let Ok(mut stream) = TcpStream::connect(&addr) {
+    if let Some(mut stream) = stream_opt {
         let req = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             path, addr
@@ -100,20 +112,28 @@ fn trigger_via_cli(args: &[String], port: u16) {
 }
 
 fn run_daemon() {
-    println!("[Daemon] Initializing...");
-    let config = Config::load_or_create("config.toml");
+    let mut config = Config::load_or_create("config.toml");
     let addr = format!("127.0.0.1:{}", config.server.port);
 
-    if config.server.enabled && TcpStream::connect(&addr).is_ok() {
-        println!("[Daemon] Another instance is already listening on {}. Triggering it...", addr);
-        trigger_via_cli(&[], config.server.port);
-        return;
-    }
+    // Bind immediately to check single instance without any 2-second TCP timeout delay
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(_) => {
+            println!(
+                "[Daemon] Another instance is already listening on {}. Triggering it...",
+                addr
+            );
+            trigger_via_cli(&[], config.server.port);
+            return;
+        }
+    };
 
-    let mut config = config;
     let mut overlay = match Overlay::new(&config) {
         Ok(o) => {
-            println!("[Daemon] Overlay created successfully (hwnd: {:?})", o.hwnd);
+            println!(
+                "[Daemon] Overlay created ({}x{}, hwnd: {:?})",
+                o.width, o.height, o.hwnd
+            );
             o
         }
         Err(e) => {
@@ -123,25 +143,21 @@ fn run_daemon() {
     };
 
     let _tray = TrayIcon::new(overlay.hwnd);
-    println!("[Daemon] Tray icon created.");
-
     let (tx, rx): (Sender<NotifyRequest>, Receiver<NotifyRequest>) = channel();
 
     if config.server.enabled {
-        start_server(config.server.port, tx, overlay.hwnd.0 as usize);
-        println!("[Daemon] Server started on port {}", config.server.port);
+        start_server(listener, tx, overlay.hwnd.0 as usize);
+        println!("[Daemon] Server started on http://{}", addr);
     }
 
-    println!("[Daemon] Triggering welcome glow...");
-    overlay.trigger_glow(&config, None, Some(1.5), None);
+    // Trigger initial welcome glow (2.5s) on startup
+    overlay.trigger_glow(&config, None, Some(2.5), None);
 
-    println!("[Daemon] Entering message loop...");
     unsafe {
         let mut msg = MSG::default();
         loop {
             let ret = GetMessageW(&mut msg, None, 0, 0);
             if ret.0 == 0 || ret.0 == -1 {
-                println!("[Daemon] GetMessageW returned {}, exiting loop", ret.0);
                 break;
             }
 
@@ -152,11 +168,9 @@ fn run_daemon() {
                     }
                 }
                 WM_TRIGGER_GLOW => {
-                    println!("[Daemon] WM_TRIGGER_GLOW received");
                     overlay.trigger_glow(&config, None, None, None);
                 }
                 WM_SERVER_NOTIFY => {
-                    println!("[Daemon] WM_SERVER_NOTIFY received");
                     while let Ok(req) = rx.try_recv() {
                         overlay.trigger_glow(
                             &config,
@@ -167,7 +181,6 @@ fn run_daemon() {
                     }
                 }
                 WM_RELOAD_CONFIG => {
-                    println!("[Daemon] Reloading config");
                     config = Config::load_or_create("config.toml");
                     let rgb = config.rgb();
                     overlay.render_gradient(rgb, config.glow.border_width);
@@ -179,11 +192,9 @@ fn run_daemon() {
                     }
                 }
                 WM_CLOSE | WM_DESTROY => {
-                    println!("[Daemon] WM_CLOSE/DESTROY received");
                     PostQuitMessage(0);
                 }
                 WM_QUIT => {
-                    println!("[Daemon] WM_QUIT received");
                     break;
                 }
                 _ => {
@@ -193,5 +204,4 @@ fn run_daemon() {
             }
         }
     }
-    println!("[Daemon] Exited.");
 }

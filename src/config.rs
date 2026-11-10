@@ -45,19 +45,19 @@ fn default_color() -> String {
     "#FF2222".to_string()
 }
 fn default_border_width() -> u32 {
-    45
+    80
 }
 fn default_pulse_speed() -> f32 {
-    1.8
+    1.5
 }
 fn default_duration_secs() -> f32 {
     5.0
 }
 fn default_max_opacity() -> f32 {
-    0.85
+    0.95
 }
 fn default_min_opacity() -> f32 {
-    0.15
+    0.25
 }
 fn default_server_enabled() -> bool {
     true
